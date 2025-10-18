@@ -736,6 +736,126 @@ int tca9546_scan_all_channels(const char* device) {
     return 0;
 }
 
+//add to support 16-bit read/write 
+int read_i2c_register16(const char* device, int slave_addr, int reg_addr) {
+    int fd = open(device, O_RDWR);
+    if (fd < 0) {
+        printf("Failed to open %s: %s\n", device, strerror(errno));
+        return -1;
+    }
+
+    // First, prepare 16-bit register address properly
+    unsigned char reg_msb = (reg_addr >> 8) & 0xFF;
+    unsigned char reg_lsb = reg_addr & 0xFF;
+    
+    // Create the register address buffer
+    struct {
+        i2c_send_t header;
+        unsigned char reg[2];
+    } send_packet;
+    
+    send_packet.header.slave.addr = slave_addr;
+    send_packet.header.slave.fmt = I2C_ADDRFMT_7BIT;
+    send_packet.header.len = 2;
+    send_packet.header.stop = 1;  // Complete this transaction with STOP
+    send_packet.reg[0] = reg_msb;
+    send_packet.reg[1] = reg_lsb;
+    
+    // Send the register address first with a STOP
+    int status = devctl(fd, DCMD_I2C_SEND, &send_packet, sizeof(send_packet), NULL);
+    if (status != 0) {
+        printf("Failed to send 16-bit register address 0x%04x to slave 0x%02x: status %d\n", 
+               reg_addr, slave_addr, status);
+        close(fd);
+        return -1;
+    }
+    
+    // Small delay to ensure device processes the address
+    usleep(1000);  // 1ms delay
+    
+    // Now perform a simple receive operation
+    struct {
+        i2c_recv_t header;
+        unsigned char data;
+    } recv_packet;
+    
+    recv_packet.header.slave.addr = slave_addr;
+    recv_packet.header.slave.fmt = I2C_ADDRFMT_7BIT;
+    recv_packet.header.len = 1;
+    recv_packet.header.stop = 1;
+    
+    status = devctl(fd, DCMD_I2C_RECV, &recv_packet, sizeof(recv_packet), NULL);
+    if (status != 0) {
+        printf("Failed to read from slave 0x%02x: status %d\n", slave_addr, status);
+        close(fd);
+        return -1;
+    }
+    
+    printf("Read from slave 0x%02x 16-bit register 0x%04x: 0x%02x\n", 
+           slave_addr, reg_addr, recv_packet.data);
+    
+    close(fd);
+    return recv_packet.data;
+}
+
+int write_i2c_register16(const char* device, int slave_addr, int reg_addr, int value) {
+    int fd = open(device, O_RDWR);
+    if (fd < 0) {
+        printf("Failed to open %s: %s\n", device, strerror(errno));
+        return -1;
+    }
+
+    // First, send just the 16-bit register address
+    struct {
+        i2c_send_t header;
+        unsigned char reg[2];
+    } send_reg_packet;
+    
+    send_reg_packet.header.slave.addr = slave_addr;
+    send_reg_packet.header.slave.fmt = I2C_ADDRFMT_7BIT;
+    send_reg_packet.header.len = 2;
+    send_reg_packet.header.stop = 1;  // Complete with STOP
+    send_reg_packet.reg[0] = (reg_addr >> 8) & 0xFF;
+    send_reg_packet.reg[1] = reg_addr & 0xFF;
+    
+    int status = devctl(fd, DCMD_I2C_SEND, &send_reg_packet, sizeof(send_reg_packet), NULL);
+    if (status != 0) {
+        printf("Failed to send 16-bit register address 0x%04x to slave 0x%02x: status %d\n",
+               reg_addr, slave_addr, status);
+        close(fd);
+        return -1;
+    }
+    
+    // Small delay
+    usleep(1000);  // 1ms delay
+    
+    // Now send the data value
+    struct {
+        i2c_send_t header;
+        unsigned char data;
+    } send_data_packet;
+    
+    send_data_packet.header.slave.addr = slave_addr;
+    send_data_packet.header.slave.fmt = I2C_ADDRFMT_7BIT;
+    send_data_packet.header.len = 1;
+    send_data_packet.header.stop = 1;
+    send_data_packet.data = value;
+    
+    status = devctl(fd, DCMD_I2C_SEND, &send_data_packet, sizeof(send_data_packet), NULL);
+    if (status != 0) {
+        printf("Failed to write 0x%02x to 16-bit register 0x%04x of slave 0x%02x: status %d\n",
+               value, reg_addr, slave_addr, status);
+        close(fd);
+        return -1;
+    }
+
+    printf("Wrote 0x%02x to slave 0x%02x 16-bit register 0x%04x\n",
+           value, slave_addr, reg_addr);
+
+    close(fd);
+    return 0;
+}
+
 int main(int argc, char* argv[]) {
     if (argc < 3) {
         printf("Usage: %s <device> <command> [args...]\n", argv[0]);
@@ -743,7 +863,10 @@ int main(int argc, char* argv[]) {
         printf("  scan                       - Scan I2C bus for devices\n");
         printf("  debug                      - Debug scan showing status codes\n");
         printf("  read <addr> <reg>          - Read register from device\n");
-        printf("  write <addr> <reg> <value> - Write value to register\n");
+        //printf("  write <addr> <reg> <value> - Write value to register\n");
+        printf("  %s /dev/i2c3 read16 0x24 0x100d\n", argv[0]);
+        printf("  %s /dev/i2c3 write 0x24 0x00 0xFF\n", argv[0]);
+        printf("  %s /dev/i2c3 write16 0x24 0x100d 0x55\n", argv[0]);
         printf("  tca-set <channel_mask>     - Set TCA9546 channels (0x70)\n");
         printf("  tca-get                    - Get current TCA9546 channel status\n");
         printf("  tca-scan                   - Scan all TCA9546 channels\n");
@@ -773,11 +896,22 @@ int main(int argc, char* argv[]) {
         int reg_addr = strtol(argv[4], NULL, 0);
         return read_i2c_register(device, slave_addr, reg_addr);
     }
+    else if (strcmp(command, "read16") == 0 && argc >= 5) {
+        int slave_addr = strtol(argv[3], NULL, 0);
+        int reg_addr = strtol(argv[4], NULL, 0);
+        return read_i2c_register16(device, slave_addr, reg_addr);
+    }
     else if (strcmp(command, "write") == 0 && argc >= 6) {
         int slave_addr = strtol(argv[3], NULL, 0);
         int reg_addr = strtol(argv[4], NULL, 0);
         int value = strtol(argv[5], NULL, 0);
         return write_i2c_register(device, slave_addr, reg_addr, value);
+    }
+    else if (strcmp(command, "write16") == 0 && argc >= 6) {
+        int slave_addr = strtol(argv[3], NULL, 0);
+        int reg_addr = strtol(argv[4], NULL, 0);
+        int value = strtol(argv[5], NULL, 0);
+        return write_i2c_register16(device, slave_addr, reg_addr, value);
     }
     else if (strcmp(command, "tca-set") == 0 && argc >= 4) {
         int channel_mask = strtol(argv[3], NULL, 0);
