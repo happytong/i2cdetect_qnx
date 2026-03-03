@@ -34,6 +34,9 @@ typedef struct {
     int initialized;        // Initialization status
 } i2c_bus_config_t;
 
+// Forward declarations
+void i2c_identify_device(i2c_bus_config_t* bus_config, unsigned char addr, char* device_type);
+
 int i2c_init_bus(const char* device_path, i2c_bus_config_t* bus_config) {
     // Open I2C bus device
     bus_config->fd = open(device_path, O_RDWR);
@@ -92,11 +95,16 @@ int i2c_probe_device(i2c_bus_config_t* bus_config, unsigned char slave_addr) {
     int status = devctl(bus_config->fd, DCMD_I2C_RECV,
                        &recv_packet, sizeof(recv_packet), NULL);
 
-    // Device present if no error or specific acceptable errors
-    return (status == EOK || status == ETIMEDOUT);
+    // Device present only if read succeeds (ETIMEDOUT means no response)
+    return (status == EOK);
 }
 int i2c_read_register(i2c_bus_config_t* bus_config, unsigned char slave_addr,
                      unsigned char reg_addr, unsigned char* data, int len) {
+    // Validate length against internal buffer size
+    if (len <= 0 || len > 256) {
+        return EINVAL;
+    }
+
     // First send register address
     struct {
         i2c_send_t header;
@@ -296,14 +304,20 @@ void i2c_debug_device(i2c_bus_config_t* bus_config, unsigned char slave_addr) {
         }
     }
 
-    // Test write capability (safe register)
+    // Test write capability using safe read-back method on output registers
     printf("Write test: ");
-    unsigned char test_val = 0x55;
-    int status = i2c_write_register(bus_config, slave_addr, 0x00, &test_val, 1);
-    if (status == EOK) {
-        printf("SUCCESS\n");
+    unsigned char original_val;
+    int rstatus = i2c_read_register(bus_config, slave_addr, 0x12, &original_val, 1);
+    if (rstatus == EOK) {
+        // Write back the same value to avoid changing device state
+        int wstatus = i2c_write_register(bus_config, slave_addr, 0x12, &original_val, 1);
+        if (wstatus == EOK) {
+            printf("SUCCESS (reg 0x12 write-back verified)\n");
+        } else {
+            printf("WRITE FAILED (%d)\n", wstatus);
+        }
     } else {
-        printf("FAILED (%d)\n", status);
+        printf("SKIPPED (cannot read reg 0x12: %d)\n", rstatus);
     }
 }
 int i2c_health_check(const char* device_path) {
@@ -428,182 +442,128 @@ void i2c_identify_device(i2c_bus_config_t* bus_config, unsigned char addr, char*
     strcpy(device_type, "Unknown");
 }
 
-///////////////////////////////////////////////////////////////////////////////////
-///////////////Part 2: actual codes for "i2cdetect" tool///////////////////////////
-///////////////////////////////////////////////////////////////////////////////////
-
-int scan_i2c_bus(const char* device) {
-    int fd = open(device, O_RDWR);
-    int row, col, addr;
-    if (fd < 0) {
-        printf("Failed to open %s: %s\n", device, strerror(errno));
-        return -1;
-    }
-
-    printf("Scanning I2C bus %s:\n", device);
-    printf("     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f\n");
-    
-    for (row = 0; row < 8; row++) {
-        printf("%02x: ", row * 16);
-        for (col = 0; col < 16; col++) {
-            addr = row * 16 + col;
-            if (addr < 0x08 || addr > 0x77) {
-                printf("   ");
-                continue;
-            }
-            
-            // Try to read from device - use 1-byte read for better detection
-            struct {
-                i2c_recv_t header;
-                unsigned char data;
-            } recv_packet;
-            
-            recv_packet.header.slave.addr = addr;
-            recv_packet.header.slave.fmt = I2C_ADDRFMT_7BIT;
-            recv_packet.header.len = 1;  // Try to read 1 byte
-            recv_packet.header.stop = 1;
-            
-            int status = devctl(fd, DCMD_I2C_RECV, &recv_packet, sizeof(recv_packet), NULL);
-            if (status == 0) {
-                printf("%02x ", addr);
-            } else {
-                printf("-- ");
-            }
-        }
-        printf("\n");
-    }
-    
-    close(fd);
-    return 0;
-}
-
-int debug_scan_i2c_bus(const char* device) {
-    int fd = open(device, O_RDWR);
-    int row, col, addr;
-    if (fd < 0) {
-        printf("Failed to open %s: %s\n", device, strerror(errno));
-        return -1;
-    }
-
-    printf("Debug scanning I2C bus %s (showing status codes):\n", device);
-    printf("     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f\n");
-    
-    for (row = 0; row < 8; row++) {
-        printf("%02x: ", row * 16);
-        for (col = 0; col < 16; col++) {
-            addr = row * 16 + col;
-            if (addr < 0x08 || addr > 0x77) {
-                printf("   ");
-                continue;
-            }
-            
-            // Try zero-length operation for more reliable detection
-            i2c_send_t send_zero;
-            send_zero.slave.addr = addr;
-            send_zero.slave.fmt = I2C_ADDRFMT_7BIT;
-            send_zero.len = 0;
-            send_zero.stop = 1;
-            
-            int status = devctl(fd, DCMD_I2C_SEND, &send_zero, sizeof(send_zero), NULL);
-            if (status == 0) {
-                printf("%02x ", addr);
-            } else {
-                printf("-%d ", status);
-            }
-        }
-        printf("\n");
-    }
-    
-    close(fd);
-    return 0;
-}
-
-int read_i2c_register(const char* device, int slave_addr, int reg_addr) {
-    int fd = open(device, O_RDWR);
-    if (fd < 0) {
-        printf("Failed to open %s: %s\n", device, strerror(errno));
-        return -1;
-    }
-
-    // First send register address
+// Raw send without register address - for devices like TCA9546 that use direct byte protocol
+int i2c_send_raw(i2c_bus_config_t* bus_config, unsigned char slave_addr,
+                 unsigned char* data, int len) {
     struct {
         i2c_send_t header;
-        unsigned char reg;
+        unsigned char payload[256];
     } send_packet;
-    
+
+    if (len <= 0 || len > 256) {
+        return EINVAL;
+    }
+
     send_packet.header.slave.addr = slave_addr;
     send_packet.header.slave.fmt = I2C_ADDRFMT_7BIT;
-    send_packet.header.len = 1;
-    send_packet.header.stop = 0;  // No stop, we'll read next
-    send_packet.reg = reg_addr;
-    
-    int status = devctl(fd, DCMD_I2C_SEND, &send_packet, sizeof(send_packet), NULL);
-    if (status != 0) {
-        printf("Failed to send register address 0x%02x to slave 0x%02x: status %d\n", 
-               reg_addr, slave_addr, status);
-        close(fd);
-        return -1;
-    }
-    
-    // Now read the data
+    send_packet.header.len = len;
+    send_packet.header.stop = 1;
+    memcpy(send_packet.payload, data, len);
+
+    return devctl(bus_config->fd, DCMD_I2C_SEND,
+                 &send_packet, sizeof(send_packet.header) + len, NULL);
+}
+
+// Raw receive without register address - for devices like TCA9546
+int i2c_recv_raw(i2c_bus_config_t* bus_config, unsigned char slave_addr,
+                 unsigned char* data, int len) {
     struct {
         i2c_recv_t header;
-        unsigned char data;
+        unsigned char payload[256];
     } recv_packet;
-    
+
+    if (len <= 0 || len > 256) {
+        return EINVAL;
+    }
+
     recv_packet.header.slave.addr = slave_addr;
     recv_packet.header.slave.fmt = I2C_ADDRFMT_7BIT;
-    recv_packet.header.len = 1;
+    recv_packet.header.len = len;
     recv_packet.header.stop = 1;
-    
-    status = devctl(fd, DCMD_I2C_RECV, &recv_packet, sizeof(recv_packet), NULL);
-    if (status != 0) {
-        printf("Failed to read from slave 0x%02x: status %d\n", slave_addr, status);
-        close(fd);
-        return -1;
+
+    int status = devctl(bus_config->fd, DCMD_I2C_RECV,
+                       &recv_packet, sizeof(recv_packet), NULL);
+    if (status == EOK) {
+        memcpy(data, recv_packet.payload, len);
     }
-    
-    printf("Read from slave 0x%02x register 0x%02x: 0x%02x\n", 
-           slave_addr, reg_addr, recv_packet.data);
-    
-    close(fd);
-    return recv_packet.data;
+
+    return status;
 }
 
-int write_i2c_register(const char* device, int slave_addr, int reg_addr, int value) {
-    int fd = open(device, O_RDWR);
-    if (fd < 0) {
-        printf("Failed to open %s: %s\n", device, strerror(errno));
-        return -1;
+// Read from device with 16-bit register address
+int i2c_read_register16(i2c_bus_config_t* bus_config, unsigned char slave_addr,
+                        unsigned int reg_addr, unsigned char* data, int len) {
+    if (len <= 0 || len > 256) {
+        return EINVAL;
     }
 
-    // Send register address and data in one operation
+    // Send 16-bit register address with no STOP (repeated start)
     struct {
         i2c_send_t header;
-        unsigned char data[2];  // [register_address, value]
+        unsigned char reg[2];
     } send_packet;
 
     send_packet.header.slave.addr = slave_addr;
     send_packet.header.slave.fmt = I2C_ADDRFMT_7BIT;
-    send_packet.header.len = 2;  // Register address + data
-    send_packet.header.stop = 1; // Complete transaction
-    send_packet.data[0] = reg_addr;
-    send_packet.data[1] = value;
+    send_packet.header.len = 2;
+    send_packet.header.stop = 0;  // No stop - use repeated start for read phase
+    send_packet.reg[0] = (reg_addr >> 8) & 0xFF;
+    send_packet.reg[1] = reg_addr & 0xFF;
 
-    int status = devctl(fd, DCMD_I2C_SEND, &send_packet, sizeof(send_packet), NULL);
-    if (status != 0) {
-        printf("Failed to write 0x%02x to register 0x%02x of slave 0x%02x: status %d\n",
-               value, reg_addr, slave_addr, status);
-        close(fd);
-        return -1;
+    int status = devctl(bus_config->fd, DCMD_I2C_SEND,
+                       &send_packet, sizeof(send_packet), NULL);
+    if (status != EOK) {
+        return status;
     }
 
-    printf("Wrote 0x%02x to slave 0x%02x register 0x%02x\n",
-           value, slave_addr, reg_addr);
+    // Read data using repeated start
+    struct {
+        i2c_recv_t header;
+        unsigned char data[256];
+    } recv_packet;
 
-    close(fd);
-    return 0;
+    recv_packet.header.slave.addr = slave_addr;
+    recv_packet.header.slave.fmt = I2C_ADDRFMT_7BIT;
+    recv_packet.header.len = len;
+    recv_packet.header.stop = 1;
+
+    status = devctl(bus_config->fd, DCMD_I2C_RECV,
+                   &recv_packet, sizeof(recv_packet), NULL);
+    if (status == EOK) {
+        memcpy(data, recv_packet.data, len);
+    }
+
+    return status;
 }
+
+// Write to device with 16-bit register address
+int i2c_write_register16(i2c_bus_config_t* bus_config, unsigned char slave_addr,
+                         unsigned int reg_addr, unsigned char* data, int len) {
+    struct {
+        i2c_send_t header;
+        unsigned char payload[258];  // 2 bytes reg + up to 256 bytes data
+    } send_packet;
+
+    if (len <= 0 || len > 256) {
+        return EINVAL;
+    }
+
+    send_packet.header.slave.addr = slave_addr;
+    send_packet.header.slave.fmt = I2C_ADDRFMT_7BIT;
+    send_packet.header.len = len + 2;
+    send_packet.header.stop = 1;
+
+    send_packet.payload[0] = (reg_addr >> 8) & 0xFF;
+    send_packet.payload[1] = reg_addr & 0xFF;
+    memcpy(&send_packet.payload[2], data, len);
+
+    return devctl(bus_config->fd, DCMD_I2C_SEND,
+                 &send_packet, sizeof(send_packet.header) + len + 2, NULL);
+}
+
+///////////////////////////////////////////////////////////////////////////////////
+///////////////Part 2: CLI commands using Part 1 library //////////////////////////
+///////////////////////////////////////////////////////////////////////////////////
 
 // TCA9546 specific constants, for the case TCA9546 control the other i2c chips (working for the same bus only):
 // Microcontroller (Master)
@@ -618,40 +578,15 @@ int write_i2c_register(const char* device, int slave_addr, int reg_addr, int val
 //     |---- Channel 3  MCP23017 #4 (Address: 0x20)
 #define TCA9546_ADDR 0x70
 
-int tca9546_set_channel(const char* device, int channel_mask) {
-    int fd = open(device, O_RDWR);
-    if (fd < 0) {
-        printf("Failed to open %s: %s\n", device, strerror(errno));
-        return -1;
-    }
-
-    // Send channel selection to TCA9546
-    struct {
-        i2c_send_t header;
-        unsigned char channel;
-    } send_packet;
-
-    send_packet.header.slave.addr = TCA9546_ADDR;
-    send_packet.header.slave.fmt = I2C_ADDRFMT_7BIT;
-    send_packet.header.len = 1;
-    send_packet.header.stop = 1;
-    send_packet.channel = channel_mask & 0x0F;  // Only bits 0-3 are valid
-
-    int status = devctl(fd, DCMD_I2C_SEND, &send_packet, sizeof(send_packet), NULL);
-    if (status != 0) {
-        printf("Failed to set TCA9546 channel 0x%02x: status %d\n", channel_mask, status);
-        close(fd);
-        return -1;
-    }
-
-    printf("TCA9546 channels set to: 0x%02x ", channel_mask);
+// Helper to print TCA9546 channel mask
+static void print_channel_mask(unsigned char channel_mask) {
     printf("(");
     if (channel_mask == 0) {
         printf("all disabled");
     } else {
         int first = 1;
-        int i=0;
-        for ( i = 0; i < 4; i++) {
+        int i = 0;
+        for (i = 0; i < 4; i++) {
             if (channel_mask & (1 << i)) {
                 if (!first) printf(", ");
                 printf("CH%d", i);
@@ -659,200 +594,177 @@ int tca9546_set_channel(const char* device, int channel_mask) {
             }
         }
     }
-    printf(")\n");
-
-    close(fd);
-    return 0;
+    printf(")");
 }
 
-int tca9546_get_channel(const char* device) {
-    int fd = open(device, O_RDWR);
-    if (fd < 0) {
-        printf("Failed to open %s: %s\n", device, strerror(errno));
-        return -1;
-    }
+int cmd_scan(i2c_bus_config_t* bus_config) {
+    int row, col, addr;
 
-    // Read current channel selection from TCA9546
-    struct {
-        i2c_recv_t header;
-        unsigned char channel;
-    } recv_packet;
+    printf("Scanning I2C bus %s:\n", bus_config->device_path);
+    printf("     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f\n");
 
-    recv_packet.header.slave.addr = TCA9546_ADDR;
-    recv_packet.header.slave.fmt = I2C_ADDRFMT_7BIT;
-    recv_packet.header.len = 1;
-    recv_packet.header.stop = 1;
+    for (row = 0; row < 8; row++) {
+        printf("%02x: ", row * 16);
+        for (col = 0; col < 16; col++) {
+            addr = row * 16 + col;
+            if (addr < 0x08 || addr > 0x77) {
+                printf("   ");
+                continue;
+            }
 
-    int status = devctl(fd, DCMD_I2C_RECV, &recv_packet, sizeof(recv_packet), NULL);
-    if (status != 0) {
-        printf("Failed to read TCA9546 channel status: status %d\n", status);
-        close(fd);
-        return -1;
-    }
-
-    printf("TCA9546 current channels: 0x%02x ", recv_packet.channel);
-    printf("(");
-    if (recv_packet.channel == 0) {
-        printf("all disabled");
-    } else {
-        int first = 1;
-        int i=0;
-        for (i = 0; i < 4; i++) {
-            if (recv_packet.channel & (1 << i)) {
-                if (!first) printf(", ");
-                printf("CH%d", i);
-                first = 0;
+            if (i2c_probe_device(bus_config, addr)) {
+                printf("%02x ", addr);
+            } else {
+                printf("-- ");
             }
         }
+        printf("\n");
     }
-    printf(")\n");
 
-    close(fd);
-    return recv_packet.channel;
-}
-
-int tca9546_scan_all_channels(const char* device) {
-    printf("Scanning all TCA9546 channels on %s:\n", device);
-    printf("=========================================\n");
-
-    int ch = 0;
-    for ( ch = 0; ch < 4; ch++) {
-        printf("\n--- Channel %d ---\n", ch);
-        
-        // Enable only this channel - use SAME device for TCA9546 control
-        if (tca9546_set_channel(device, 1 << ch) != 0) {
-            printf("Failed to enable channel %d\n", ch);
-            continue;
-        }
-        
-        // Scan the same bus where TCA9546 is located
-        scan_i2c_bus(device);
-    }
-    
-    // Disable all channels when done
-    printf("\n--- Disabling all channels ---\n");
-    tca9546_set_channel(device, 0x00);
-    
     return 0;
 }
 
-//add to support 16-bit read/write 
-int read_i2c_register16(const char* device, int slave_addr, int reg_addr) {
-    int fd = open(device, O_RDWR);
-    if (fd < 0) {
-        printf("Failed to open %s: %s\n", device, strerror(errno));
-        return -1;
+int cmd_debug_scan(i2c_bus_config_t* bus_config) {
+    int row, col, addr;
+
+    printf("Debug scanning I2C bus %s (showing status codes):\n", bus_config->device_path);
+    printf("     0  1  2  3  4  5  6  7  8  9  a  b  c  d  e  f\n");
+
+    for (row = 0; row < 8; row++) {
+        printf("%02x: ", row * 16);
+        for (col = 0; col < 16; col++) {
+            addr = row * 16 + col;
+            if (addr < 0x08 || addr > 0x77) {
+                printf("   ");
+                continue;
+            }
+
+            // Try zero-length send for debug detection (shows raw status codes)
+            i2c_send_t send_zero;
+            send_zero.slave.addr = addr;
+            send_zero.slave.fmt = I2C_ADDRFMT_7BIT;
+            send_zero.len = 0;
+            send_zero.stop = 1;
+
+            int status = devctl(bus_config->fd, DCMD_I2C_SEND, &send_zero, sizeof(send_zero), NULL);
+            if (status == 0) {
+                printf("%02x ", addr);
+            } else {
+                printf("-%d ", status);
+            }
+        }
+        printf("\n");
     }
 
-    // First, prepare 16-bit register address properly
-    unsigned char reg_msb = (reg_addr >> 8) & 0xFF;
-    unsigned char reg_lsb = reg_addr & 0xFF;
-    
-    // Create the register address buffer
-    struct {
-        i2c_send_t header;
-        unsigned char reg[2];
-    } send_packet;
-    
-    send_packet.header.slave.addr = slave_addr;
-    send_packet.header.slave.fmt = I2C_ADDRFMT_7BIT;
-    send_packet.header.len = 2;
-    send_packet.header.stop = 1;  // Complete this transaction with STOP
-    send_packet.reg[0] = reg_msb;
-    send_packet.reg[1] = reg_lsb;
-    
-    // Send the register address first with a STOP
-    int status = devctl(fd, DCMD_I2C_SEND, &send_packet, sizeof(send_packet), NULL);
-    if (status != 0) {
-        printf("Failed to send 16-bit register address 0x%04x to slave 0x%02x: status %d\n", 
-               reg_addr, slave_addr, status);
-        close(fd);
-        return -1;
-    }
-    
-    // Small delay to ensure device processes the address
-    usleep(1000);  // 1ms delay
-    
-    // Now perform a simple receive operation
-    struct {
-        i2c_recv_t header;
-        unsigned char data;
-    } recv_packet;
-    
-    recv_packet.header.slave.addr = slave_addr;
-    recv_packet.header.slave.fmt = I2C_ADDRFMT_7BIT;
-    recv_packet.header.len = 1;
-    recv_packet.header.stop = 1;
-    
-    status = devctl(fd, DCMD_I2C_RECV, &recv_packet, sizeof(recv_packet), NULL);
-    if (status != 0) {
-        printf("Failed to read from slave 0x%02x: status %d\n", slave_addr, status);
-        close(fd);
-        return -1;
-    }
-    
-    printf("Read from slave 0x%02x 16-bit register 0x%04x: 0x%02x\n", 
-           slave_addr, reg_addr, recv_packet.data);
-    
-    close(fd);
-    return recv_packet.data;
+    return 0;
 }
 
-int write_i2c_register16(const char* device, int slave_addr, int reg_addr, int value) {
-    int fd = open(device, O_RDWR);
-    if (fd < 0) {
-        printf("Failed to open %s: %s\n", device, strerror(errno));
+int cmd_read(i2c_bus_config_t* bus_config, int slave_addr, int reg_addr) {
+    unsigned char data;
+    int status = i2c_read_register(bus_config, slave_addr, reg_addr, &data, 1);
+    if (status != EOK) {
+        printf("Failed to read from slave 0x%02x register 0x%02x: status %d\n",
+               slave_addr, reg_addr, status);
         return -1;
     }
 
-    // First, send just the 16-bit register address
-    struct {
-        i2c_send_t header;
-        unsigned char reg[2];
-    } send_reg_packet;
-    
-    send_reg_packet.header.slave.addr = slave_addr;
-    send_reg_packet.header.slave.fmt = I2C_ADDRFMT_7BIT;
-    send_reg_packet.header.len = 2;
-    send_reg_packet.header.stop = 1;  // Complete with STOP
-    send_reg_packet.reg[0] = (reg_addr >> 8) & 0xFF;
-    send_reg_packet.reg[1] = reg_addr & 0xFF;
-    
-    int status = devctl(fd, DCMD_I2C_SEND, &send_reg_packet, sizeof(send_reg_packet), NULL);
-    if (status != 0) {
-        printf("Failed to send 16-bit register address 0x%04x to slave 0x%02x: status %d\n",
-               reg_addr, slave_addr, status);
-        close(fd);
+    printf("Read from slave 0x%02x register 0x%02x: 0x%02x\n",
+           slave_addr, reg_addr, data);
+    return data;
+}
+
+int cmd_write(i2c_bus_config_t* bus_config, int slave_addr, int reg_addr, int value) {
+    unsigned char data = (unsigned char)value;
+    int status = i2c_write_register(bus_config, slave_addr, reg_addr, &data, 1);
+    if (status != EOK) {
+        printf("Failed to write 0x%02x to register 0x%02x of slave 0x%02x: status %d\n",
+               value, reg_addr, slave_addr, status);
         return -1;
     }
-    
-    // Small delay
-    usleep(1000);  // 1ms delay
-    
-    // Now send the data value
-    struct {
-        i2c_send_t header;
-        unsigned char data;
-    } send_data_packet;
-    
-    send_data_packet.header.slave.addr = slave_addr;
-    send_data_packet.header.slave.fmt = I2C_ADDRFMT_7BIT;
-    send_data_packet.header.len = 1;
-    send_data_packet.header.stop = 1;
-    send_data_packet.data = value;
-    
-    status = devctl(fd, DCMD_I2C_SEND, &send_data_packet, sizeof(send_data_packet), NULL);
-    if (status != 0) {
+
+    printf("Wrote 0x%02x to slave 0x%02x register 0x%02x\n",
+           value, slave_addr, reg_addr);
+    return 0;
+}
+
+int cmd_read16(i2c_bus_config_t* bus_config, int slave_addr, int reg_addr) {
+    unsigned char data;
+    int status = i2c_read_register16(bus_config, slave_addr, reg_addr, &data, 1);
+    if (status != EOK) {
+        printf("Failed to read from slave 0x%02x 16-bit register 0x%04x: status %d\n",
+               slave_addr, reg_addr, status);
+        return -1;
+    }
+
+    printf("Read from slave 0x%02x 16-bit register 0x%04x: 0x%02x\n",
+           slave_addr, reg_addr, data);
+    return data;
+}
+
+int cmd_write16(i2c_bus_config_t* bus_config, int slave_addr, int reg_addr, int value) {
+    unsigned char data = (unsigned char)value;
+    int status = i2c_write_register16(bus_config, slave_addr, reg_addr, &data, 1);
+    if (status != EOK) {
         printf("Failed to write 0x%02x to 16-bit register 0x%04x of slave 0x%02x: status %d\n",
                value, reg_addr, slave_addr, status);
-        close(fd);
         return -1;
     }
 
     printf("Wrote 0x%02x to slave 0x%02x 16-bit register 0x%04x\n",
            value, slave_addr, reg_addr);
+    return 0;
+}
 
-    close(fd);
+int cmd_tca_set_channel(i2c_bus_config_t* bus_config, int channel_mask) {
+    unsigned char data = channel_mask & 0x0F;  // Only bits 0-3 are valid
+    int status = i2c_send_raw(bus_config, TCA9546_ADDR, &data, 1);
+    if (status != EOK) {
+        printf("Failed to set TCA9546 channel 0x%02x: status %d\n", channel_mask, status);
+        return -1;
+    }
+
+    printf("TCA9546 channels set to: 0x%02x ", data);
+    print_channel_mask(data);
+    printf("\n");
+    return 0;
+}
+
+int cmd_tca_get_channel(i2c_bus_config_t* bus_config) {
+    unsigned char data;
+    int status = i2c_recv_raw(bus_config, TCA9546_ADDR, &data, 1);
+    if (status != EOK) {
+        printf("Failed to read TCA9546 channel status: status %d\n", status);
+        return -1;
+    }
+
+    printf("TCA9546 current channels: 0x%02x ", data);
+    print_channel_mask(data);
+    printf("\n");
+    return data;
+}
+
+int cmd_tca_scan_all(i2c_bus_config_t* bus_config) {
+    printf("Scanning all TCA9546 channels on %s:\n", bus_config->device_path);
+    printf("=========================================\n");
+
+    int ch = 0;
+    for (ch = 0; ch < 4; ch++) {
+        printf("\n--- Channel %d ---\n", ch);
+
+        // Enable only this channel
+        if (cmd_tca_set_channel(bus_config, 1 << ch) != 0) {
+            printf("Failed to enable channel %d\n", ch);
+            continue;
+        }
+
+        // Scan the same bus where TCA9546 is located
+        cmd_scan(bus_config);
+    }
+
+    // Disable all channels when done
+    printf("\n--- Disabling all channels ---\n");
+    cmd_tca_set_channel(bus_config, 0x00);
+
     return 0;
 }
 
@@ -863,10 +775,9 @@ int main(int argc, char* argv[]) {
         printf("  scan                       - Scan I2C bus for devices\n");
         printf("  debug                      - Debug scan showing status codes\n");
         printf("  read <addr> <reg>          - Read register from device\n");
-        //printf("  write <addr> <reg> <value> - Write value to register\n");
-        printf("  %s /dev/i2c3 read16 0x24 0x100d\n", argv[0]);
-        printf("  %s /dev/i2c3 write 0x24 0x00 0xFF\n", argv[0]);
-        printf("  %s /dev/i2c3 write16 0x24 0x100d 0x55\n", argv[0]);
+        printf("  write <addr> <reg> <value> - Write value to register\n");
+        printf("  read16 <addr> <reg>        - Read 16-bit addressed register\n");
+        printf("  write16 <addr> <reg> <val> - Write 16-bit addressed register\n");
         printf("  tca-set <channel_mask>     - Set TCA9546 channels (0x70)\n");
         printf("  tca-get                    - Get current TCA9546 channel status\n");
         printf("  tca-scan                   - Scan all TCA9546 channels\n");
@@ -874,57 +785,71 @@ int main(int argc, char* argv[]) {
         printf("  %s /dev/i2c3 scan          # Scan bus where TCA9546 is located\n", argv[0]);
         printf("  %s /dev/i2c3 read 0x24 0x13\n", argv[0]);
         printf("  %s /dev/i2c3 write 0x24 0x00 0xFF\n", argv[0]);
+        printf("  %s /dev/i2c3 read16 0x24 0x100d\n", argv[0]);
+        printf("  %s /dev/i2c3 write16 0x24 0x100d 0x55\n", argv[0]);
         printf("  %s /dev/i2c3 tca-set 0x01    # Enable channel 0 only\n", argv[0]);
         printf("  %s /dev/i2c3 tca-set 0x05    # Enable channels 0 and 2\n", argv[0]);
         printf("  %s /dev/i2c3 tca-set 0x00    # Disable all channels\n", argv[0]);
         printf("  %s /dev/i2c3 tca-get         # Show current channel status\n", argv[0]);
-        printf("  %s /dev/i2c3 tca-scan        # Scan devices on all channels\n", argv[0]);        
+        printf("  %s /dev/i2c3 tca-scan        # Scan devices on all channels\n", argv[0]);
         return 1;
     }
-    
+
     const char* device = argv[1];
     const char* command = argv[2];
-    
+
+    // Initialize I2C bus once (sets speed, verifies driver)
+    i2c_bus_config_t bus_config = {0};
+    if (i2c_init_bus(device, &bus_config) != 0) {
+        return -1;
+    }
+
+    int result = 0;
+
     if (strcmp(command, "scan") == 0) {
-        return scan_i2c_bus(device);
-    } 
+        result = cmd_scan(&bus_config);
+    }
     else if (strcmp(command, "debug") == 0) {
-        return debug_scan_i2c_bus(device);
+        result = cmd_debug_scan(&bus_config);
     }
     else if (strcmp(command, "read") == 0 && argc >= 5) {
         int slave_addr = strtol(argv[3], NULL, 0);
         int reg_addr = strtol(argv[4], NULL, 0);
-        return read_i2c_register(device, slave_addr, reg_addr);
+        result = cmd_read(&bus_config, slave_addr, reg_addr);
     }
     else if (strcmp(command, "read16") == 0 && argc >= 5) {
         int slave_addr = strtol(argv[3], NULL, 0);
         int reg_addr = strtol(argv[4], NULL, 0);
-        return read_i2c_register16(device, slave_addr, reg_addr);
+        result = cmd_read16(&bus_config, slave_addr, reg_addr);
     }
     else if (strcmp(command, "write") == 0 && argc >= 6) {
         int slave_addr = strtol(argv[3], NULL, 0);
         int reg_addr = strtol(argv[4], NULL, 0);
         int value = strtol(argv[5], NULL, 0);
-        return write_i2c_register(device, slave_addr, reg_addr, value);
+        result = cmd_write(&bus_config, slave_addr, reg_addr, value);
     }
     else if (strcmp(command, "write16") == 0 && argc >= 6) {
         int slave_addr = strtol(argv[3], NULL, 0);
         int reg_addr = strtol(argv[4], NULL, 0);
         int value = strtol(argv[5], NULL, 0);
-        return write_i2c_register16(device, slave_addr, reg_addr, value);
+        result = cmd_write16(&bus_config, slave_addr, reg_addr, value);
     }
     else if (strcmp(command, "tca-set") == 0 && argc >= 4) {
         int channel_mask = strtol(argv[3], NULL, 0);
-        return tca9546_set_channel(device, channel_mask);
+        result = cmd_tca_set_channel(&bus_config, channel_mask);
     }
     else if (strcmp(command, "tca-get") == 0) {
-        return tca9546_get_channel(device);
+        result = cmd_tca_get_channel(&bus_config);
     }
     else if (strcmp(command, "tca-scan") == 0) {
-        return tca9546_scan_all_channels(device);
+        result = cmd_tca_scan_all(&bus_config);
     }
     else {
         printf("Invalid command or missing arguments\n");
-        return 1;
+        result = 1;
     }
+
+    // Always cleanup: close fd
+    cleanup_i2c_bus(&bus_config);
+    return result;
 }
